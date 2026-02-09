@@ -1,6 +1,5 @@
 import logging
 from typing import Optional
-from itertools import combinations
 from db import log_signal
 
 logger = logging.getLogger("arb_scanner")

@@ -5,8 +5,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from config import (
-    KALSHI_API_KEY_ID,
-    KALSHI_PRIVATE_KEY_PATH,
     MIN_ARB_PERCENT,
     SCAN_INTERVAL_SEC,
     ORDERBOOK_FETCH_WORKERS,
@@ -15,8 +13,8 @@ from config import (
 )
 from kalshi_client import KalshiClient
 from kalshi_ws import KalshiWebSocket
-from arbitrage_scanner import scan_event_for_arb, get_best_yes_ask
-from db import init_db
+from arbitrage_scanner import scan_event_for_arb
+from db import init_db, log_signal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -223,7 +221,6 @@ async def run_ws_scanner(bot: ArbBot):
     ws = KalshiWebSocket()
 
     ticker_prices: dict[str, dict] = {}
-    event_market_count: dict[str, int] = {}
 
     async def on_ticker(msg: dict):
         ticker = msg.get("market_ticker", "")
@@ -278,6 +275,20 @@ async def run_ws_scanner(bot: ArbBot):
                         "profit_cents": profit,
                         "arb_percent": arb_pct,
                     }
+                    log_signal(
+                        event_ticker=event_ticker,
+                        event_title=event_ticker,
+                        market1_ticker=t1,
+                        market1_title=f"{m1_info.get('title', t1)} YES",
+                        market1_yes_price=a1,
+                        market2_ticker=t2,
+                        market2_title=f"{m2_info.get('title', t2)} YES",
+                        market2_yes_price=a2,
+                        total_cost_cents=total,
+                        arb_profit_cents=profit,
+                        arb_percent=arb_pct,
+                        arb_type="ws_cross_market_yes",
+                    )
                     bot.total_signals += 1
                     bot.print_signal(sig)
 
@@ -305,6 +316,20 @@ async def run_ws_scanner(bot: ArbBot):
                         "profit_cents": profit,
                         "arb_percent": arb_pct,
                     }
+                    log_signal(
+                        event_ticker=event_ticker,
+                        event_title=event_ticker,
+                        market1_ticker="ALL",
+                        market1_title=f"All {n_markets} YES",
+                        market1_yes_price=total,
+                        market2_ticker="ALL",
+                        market2_title=detail,
+                        market2_yes_price=0,
+                        total_cost_cents=total,
+                        arb_profit_cents=profit,
+                        arb_percent=arb_pct,
+                        arb_type="ws_multi_market_all_yes",
+                    )
                     bot.total_signals += 1
                     bot.print_signal(sig)
 
