@@ -11,6 +11,7 @@ from config import (
     ORDERBOOK_FETCH_WORKERS,
     BANKROLL_CENTS,
     BET_PERCENT,
+    ALLOWED_CATEGORIES,
 )
 from kalshi_client import KalshiClient
 from kalshi_ws import KalshiWebSocket
@@ -53,8 +54,14 @@ class ArbBot:
         logger.info("Found %d open events total", len(all_events))
 
         two_market_events = {}
+        skipped_category = 0
         for event in all_events:
             if not event.get("mutually_exclusive"):
+                continue
+
+            category = event.get("category", "")
+            if category not in ALLOWED_CATEGORIES:
+                skipped_category += 1
                 continue
 
             event_ticker = event.get("event_ticker", "")
@@ -79,8 +86,8 @@ class ArbBot:
                     }
 
         logger.info(
-            "Found %d mutually exclusive 2-market events",
-            len(two_market_events),
+            "Found %d sports 2-market events (skipped %d non-sports)",
+            len(two_market_events), skipped_category,
         )
         return two_market_events
 
@@ -374,6 +381,7 @@ async def main():
     logger.info("Min net arb: %.1f%% (after fees)", MIN_ARB_PERCENT)
     logger.info("Bankroll: %d¢ ($%.2f)", BANKROLL_CENTS, BANKROLL_CENTS / 100)
     logger.info("Bet size: %d%% = %d¢", BET_PERCENT, BANKROLL_CENTS * BET_PERCENT // 100)
+    logger.info("Categories: %s", ", ".join(ALLOWED_CATEGORIES))
     logger.info("Only scanning 2-market mutually exclusive events")
     if duration:
         logger.info("Duration: %d seconds", duration)

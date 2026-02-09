@@ -10,7 +10,7 @@ KALSHI_WS_URL = os.getenv("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade
 API_PATH_PREFIX = "/trade-api/v2"
 
 BANKROLL_CENTS = int(os.getenv("BANKROLL", "3000"))
-BET_PERCENT = int(os.getenv("BET_PERCENT", "10"))
+BET_PERCENT = int(os.getenv("BET_PERCENT", "15"))
 MIN_ARB_PERCENT = float(os.getenv("MIN_ARB_PERCENT", "2.0"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -20,3 +20,5 @@ SCAN_INTERVAL_SEC = 30
 ORDERBOOK_FETCH_WORKERS = 20
 
 TAKER_FEE_RATE = 0.07
+
+ALLOWED_CATEGORIES = os.getenv("ALLOWED_CATEGORIES", "Sports").split(",")
