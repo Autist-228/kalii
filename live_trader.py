@@ -9,8 +9,10 @@ from kalshi_client import KalshiClient
 logger = logging.getLogger("live_trader")
 
 EVENT_COOLDOWN_SEC = 60
+FAILED_EVENT_COOLDOWN_SEC = 600
 ORDER_MONITOR_INTERVAL = 3
 ORDER_TIMEOUT_SEC = 60
+MAX_SPREAD_CENTS = 10
 
 
 class LiveTrader:
@@ -27,6 +29,7 @@ class LiveTrader:
         self.skipped_no_liquidity = 0
         self.skipped_duplicate = 0
         self._attempted_events: dict[str, float] = {}
+        self._failed_events: dict[str, float] = {}
         self._refresh_balance()
 
     def _refresh_balance(self):
@@ -48,6 +51,80 @@ class LiveTrader:
                 return True
         return False
 
+    def _check_pre_trade_liquidity(
+        self,
+        leg1_ticker: str, leg1_side: str, leg1_price: int,
+        leg2_ticker: str, leg2_side: str, leg2_price: int,
+        min_qty: int,
+    ) -> tuple[bool, str]:
+        try:
+            ob1 = self.client.get_orderbook(leg1_ticker)
+            ob2 = self.client.get_orderbook(leg2_ticker)
+        except Exception as e:
+            return False, f"orderbook fetch failed: {e}"
+
+        ob1_data = ob1.get("orderbook", ob1)
+        ob2_data = ob2.get("orderbook", ob2)
+
+        if leg1_side == "yes":
+            leg1_asks_raw = ob1_data.get("no", [])
+            if not leg1_asks_raw:
+                return False, f"leg1 {leg1_ticker} YES: no asks (empty no-bids)"
+            best_no_bid = leg1_asks_raw[-1]
+            leg1_best_ask = 100 - best_no_bid[0]
+            leg1_ask_qty = best_no_bid[1]
+            leg1_bids = ob1_data.get("yes", [])
+            leg1_best_bid = leg1_bids[-1][0] if leg1_bids else 0
+        else:
+            leg1_asks_raw = ob1_data.get("yes", [])
+            if not leg1_asks_raw:
+                return False, f"leg1 {leg1_ticker} NO: no asks (empty yes-bids)"
+            best_yes_bid = leg1_asks_raw[-1]
+            leg1_best_ask = 100 - best_yes_bid[0]
+            leg1_ask_qty = best_yes_bid[1]
+            leg1_bids = ob1_data.get("no", [])
+            leg1_best_bid = leg1_bids[-1][0] if leg1_bids else 0
+
+        if leg2_side == "yes":
+            leg2_asks_raw = ob2_data.get("no", [])
+            if not leg2_asks_raw:
+                return False, f"leg2 {leg2_ticker} YES: no asks (empty no-bids)"
+            best_no_bid = leg2_asks_raw[-1]
+            leg2_best_ask = 100 - best_no_bid[0]
+            leg2_ask_qty = best_no_bid[1]
+            leg2_bids = ob2_data.get("yes", [])
+            leg2_best_bid = leg2_bids[-1][0] if leg2_bids else 0
+        else:
+            leg2_asks_raw = ob2_data.get("yes", [])
+            if not leg2_asks_raw:
+                return False, f"leg2 {leg2_ticker} NO: no asks (empty yes-bids)"
+            best_yes_bid = leg2_asks_raw[-1]
+            leg2_best_ask = 100 - best_yes_bid[0]
+            leg2_ask_qty = best_yes_bid[1]
+            leg2_bids = ob2_data.get("no", [])
+            leg2_best_bid = leg2_bids[-1][0] if leg2_bids else 0
+
+        if leg1_ask_qty < min_qty:
+            return False, f"leg1 {leg1_ticker} volume {leg1_ask_qty} < {min_qty}"
+        if leg2_ask_qty < min_qty:
+            return False, f"leg2 {leg2_ticker} volume {leg2_ask_qty} < {min_qty}"
+
+        leg1_spread = leg1_best_ask - leg1_best_bid if leg1_best_bid > 0 else 99
+        leg2_spread = leg2_best_ask - leg2_best_bid if leg2_best_bid > 0 else 99
+        if leg1_spread > MAX_SPREAD_CENTS:
+            return False, f"leg1 {leg1_ticker} spread {leg1_spread}¢ > {MAX_SPREAD_CENTS}¢"
+        if leg2_spread > MAX_SPREAD_CENTS:
+            return False, f"leg2 {leg2_ticker} spread {leg2_spread}¢ > {MAX_SPREAD_CENTS}¢"
+
+        fresh_total = leg1_best_ask + leg2_best_ask
+        if fresh_total >= 100:
+            return False, f"fresh prices {leg1_best_ask}+{leg2_best_ask}={fresh_total}¢ >= 100 (arb gone)"
+
+        logger.info("PRE-TRADE CHECK OK: leg1 ask=%d¢ qty=%d spread=%d¢ | leg2 ask=%d¢ qty=%d spread=%d¢",
+                     leg1_best_ask, leg1_ask_qty, leg1_spread,
+                     leg2_best_ask, leg2_ask_qty, leg2_spread)
+        return True, "ok"
+
     def execute_paper_trade(self, signal: dict) -> Optional[dict]:
         event_ticker = signal["event_ticker"]
 
@@ -56,6 +133,11 @@ class LiveTrader:
             return None
 
         now = time.time()
+        last_fail = self._failed_events.get(event_ticker, 0)
+        if now - last_fail < FAILED_EVENT_COOLDOWN_SEC:
+            logger.info("SKIP: %s in failed blacklist for %ds more",
+                        event_ticker, int(FAILED_EVENT_COOLDOWN_SEC - (now - last_fail)))
+            return None
         last_attempt = self._attempted_events.get(event_ticker, 0)
         if now - last_attempt < EVENT_COOLDOWN_SEC:
             return None
@@ -91,6 +173,16 @@ class LiveTrader:
         leg2_ticker = signal["market2_ticker"]
         leg1_price = signal["market1_price"]
         leg2_price = signal["market2_price"]
+
+        liq_ok, liq_reason = self._check_pre_trade_liquidity(
+            leg1_ticker, leg1_side, leg1_price,
+            leg2_ticker, leg2_side, leg2_price,
+            contracts,
+        )
+        if not liq_ok:
+            self.skipped_no_liquidity += 1
+            logger.warning("SKIP: pre-trade liquidity check failed — %s", liq_reason)
+            return None
 
         logger.info("PLACING BOTH LEGS as GTC resting orders:")
         logger.info("  LEG 1: %s %s BUY @ %d¢ x%d",
@@ -168,6 +260,8 @@ class LiveTrader:
                 logger.warning("ONLY LEG 2 FILLED (%d) — canceling leg 1, emergency selling leg 2", leg2_filled)
                 self._cancel_order_safe(leg1_order_id)
                 self._emergency_sell(leg2_ticker, leg2_side, leg2_filled)
+            self._failed_events[event_ticker] = time.time()
+            logger.warning("EVENT BLACKLISTED for %ds: %s", FAILED_EVENT_COOLDOWN_SEC, event_ticker)
             return None
 
         if leg1_filled > matched:
