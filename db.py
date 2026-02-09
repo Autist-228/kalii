@@ -32,6 +32,34 @@ def init_db():
             executed INTEGER DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_ticker TEXT NOT NULL,
+            event_title TEXT,
+            arb_type TEXT NOT NULL,
+            leg1_ticker TEXT NOT NULL,
+            leg1_side TEXT NOT NULL,
+            leg1_price INTEGER NOT NULL,
+            leg1_qty INTEGER NOT NULL,
+            leg1_fee INTEGER NOT NULL,
+            leg2_ticker TEXT NOT NULL,
+            leg2_side TEXT NOT NULL,
+            leg2_price INTEGER NOT NULL,
+            leg2_qty INTEGER NOT NULL,
+            leg2_fee INTEGER NOT NULL,
+            total_cost_cents INTEGER NOT NULL,
+            total_fees_cents INTEGER NOT NULL,
+            net_profit_cents INTEGER NOT NULL,
+            net_arb_percent REAL NOT NULL,
+            contracts INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            exit_timestamp TEXT,
+            exit_profit_cents INTEGER DEFAULT 0,
+            exit_type TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 

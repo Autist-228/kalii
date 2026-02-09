@@ -1,8 +1,17 @@
 import logging
+import math
 from typing import Optional
+from config import TAKER_FEE_RATE
 from db import log_signal
 
 logger = logging.getLogger("arb_scanner")
+
+
+def taker_fee_cents(price_cents: int, contracts: int = 1) -> int:
+    if price_cents <= 0 or price_cents >= 100:
+        return 0
+    p = price_cents / 100.0
+    return math.ceil(TAKER_FEE_RATE * contracts * p * (1 - p) * 100)
 
 
 def get_best_yes_ask(orderbook_no: list) -> Optional[int]:
@@ -12,10 +21,12 @@ def get_best_yes_ask(orderbook_no: list) -> Optional[int]:
     return 100 - best_no_bid
 
 
-def get_best_yes_bid(orderbook_yes: list) -> Optional[int]:
-    if not orderbook_yes:
-        return None
-    return orderbook_yes[-1][0]
+def get_best_yes_ask_with_qty(orderbook_no: list) -> tuple[Optional[int], int]:
+    if not orderbook_no:
+        return None, 0
+    best_no_bid = orderbook_no[-1][0]
+    qty = orderbook_no[-1][1]
+    return 100 - best_no_bid, qty
 
 
 def get_best_no_ask(orderbook_yes: list) -> Optional[int]:
@@ -25,10 +36,12 @@ def get_best_no_ask(orderbook_yes: list) -> Optional[int]:
     return 100 - best_yes_bid
 
 
-def get_best_no_bid(orderbook_no: list) -> Optional[int]:
-    if not orderbook_no:
-        return None
-    return orderbook_no[-1][0]
+def get_best_no_ask_with_qty(orderbook_yes: list) -> tuple[Optional[int], int]:
+    if not orderbook_yes:
+        return None, 0
+    best_yes_bid = orderbook_yes[-1][0]
+    qty = orderbook_yes[-1][1]
+    return 100 - best_yes_bid, qty
 
 
 def check_yes_no_arb_single_market(
@@ -42,22 +55,33 @@ def check_yes_no_arb_single_market(
     yes_bids = orderbook.get("yes", [])
     no_bids = orderbook.get("no", [])
 
-    best_yes_ask_price = get_best_yes_ask(no_bids)
-    best_no_ask_price = get_best_no_ask(yes_bids)
+    best_yes_ask_price, yes_qty = get_best_yes_ask_with_qty(no_bids)
+    best_no_ask_price, no_qty = get_best_no_ask_with_qty(yes_bids)
 
     if best_yes_ask_price is None or best_no_ask_price is None:
         return None
 
-    total_cost = best_yes_ask_price + best_no_ask_price
+    if best_yes_ask_price <= 0 or best_no_ask_price <= 0:
+        return None
 
+    total_cost = best_yes_ask_price + best_no_ask_price
     if total_cost >= 100:
         return None
 
-    profit_cents = 100 - total_cost
-    arb_percent = (profit_cents / total_cost) * 100
+    fee1 = taker_fee_cents(best_yes_ask_price)
+    fee2 = taker_fee_cents(best_no_ask_price)
+    total_fees = fee1 + fee2
+    gross_profit = 100 - total_cost
+    net_profit = gross_profit - total_fees
 
-    if arb_percent < min_arb_percent:
+    if net_profit <= 0:
         return None
+
+    net_arb_percent = (net_profit / (total_cost + total_fees)) * 100
+    if net_arb_percent < min_arb_percent:
+        return None
+
+    available_qty = min(yes_qty, no_qty)
 
     signal = {
         "type": "yes_no_single",
@@ -70,8 +94,13 @@ def check_yes_no_arb_single_market(
         "market2_title": f"{market_title} NO",
         "market2_price": best_no_ask_price,
         "total_cost": total_cost,
-        "profit_cents": profit_cents,
-        "arb_percent": arb_percent,
+        "total_fees": total_fees,
+        "gross_profit": gross_profit,
+        "net_profit": net_profit,
+        "net_arb_percent": net_arb_percent,
+        "profit_cents": net_profit,
+        "arb_percent": net_arb_percent,
+        "available_qty": available_qty,
     }
 
     log_signal(
@@ -84,8 +113,8 @@ def check_yes_no_arb_single_market(
         market2_title=f"{market_title} NO",
         market2_yes_price=best_no_ask_price,
         total_cost_cents=total_cost,
-        arb_profit_cents=profit_cents,
-        arb_percent=arb_percent,
+        arb_profit_cents=net_profit,
+        arb_percent=net_arb_percent,
         arb_type="yes_no_single",
     )
 
@@ -101,154 +130,125 @@ def check_cross_market_arb(
     signals = []
     n_markets = len(markets_with_orderbooks)
 
-    if n_markets < 2:
+    if n_markets != 2:
         return signals
 
-    if n_markets == 2:
-        m1 = markets_with_orderbooks[0]
-        m2 = markets_with_orderbooks[1]
-        m1_ob = m1["orderbook"]
-        m2_ob = m2["orderbook"]
+    m1 = markets_with_orderbooks[0]
+    m2 = markets_with_orderbooks[1]
+    m1_ob = m1["orderbook"]
+    m2_ob = m2["orderbook"]
 
-        m1_yes_ask = get_best_yes_ask(m1_ob.get("no", []))
-        m2_yes_ask = get_best_yes_ask(m2_ob.get("no", []))
+    m1_yes_ask, m1_qty = get_best_yes_ask_with_qty(m1_ob.get("no", []))
+    m2_yes_ask, m2_qty = get_best_yes_ask_with_qty(m2_ob.get("no", []))
 
-        if m1_yes_ask is not None and m2_yes_ask is not None:
+    if m1_yes_ask is not None and m2_yes_ask is not None:
+        if m1_yes_ask > 0 and m2_yes_ask > 0:
             total = m1_yes_ask + m2_yes_ask
             if total < 100:
-                profit = 100 - total
-                arb_pct = (profit / total) * 100
-                if arb_pct >= min_arb_percent:
-                    sig = {
-                        "type": "cross_market_yes",
-                        "event_ticker": event_ticker,
-                        "event_title": event_title,
-                        "market1_ticker": m1["ticker"],
-                        "market1_title": f"{m1['title']} YES",
-                        "market1_price": m1_yes_ask,
-                        "market2_ticker": m2["ticker"],
-                        "market2_title": f"{m2['title']} YES",
-                        "market2_price": m2_yes_ask,
-                        "total_cost": total,
-                        "profit_cents": profit,
-                        "arb_percent": arb_pct,
-                    }
-                    signals.append(sig)
-                    log_signal(
-                        event_ticker=event_ticker,
-                        event_title=event_title,
-                        market1_ticker=m1["ticker"],
-                        market1_title=f"{m1['title']} YES",
-                        market1_yes_price=m1_yes_ask,
-                        market2_ticker=m2["ticker"],
-                        market2_title=f"{m2['title']} YES",
-                        market2_yes_price=m2_yes_ask,
-                        total_cost_cents=total,
-                        arb_profit_cents=profit,
-                        arb_percent=arb_pct,
-                        arb_type="cross_market_yes",
-                    )
-                    logger.info(
-                        "2-MARKET ARB (YES+YES): %s@%d¢ + %s@%d¢ = %d¢ | profit %d¢ (%.2f%%)",
-                        m1["title"], m1_yes_ask, m2["title"], m2_yes_ask, total, profit, arb_pct,
-                    )
+                fee1 = taker_fee_cents(m1_yes_ask)
+                fee2 = taker_fee_cents(m2_yes_ask)
+                total_fees = fee1 + fee2
+                gross = 100 - total
+                net = gross - total_fees
+                if net > 0:
+                    net_pct = (net / (total + total_fees)) * 100
+                    if net_pct >= min_arb_percent:
+                        available_qty = min(m1_qty, m2_qty)
+                        sig = {
+                            "type": "cross_market_yes",
+                            "event_ticker": event_ticker,
+                            "event_title": event_title,
+                            "market1_ticker": m1["ticker"],
+                            "market1_title": f"{m1['title']} YES",
+                            "market1_price": m1_yes_ask,
+                            "market2_ticker": m2["ticker"],
+                            "market2_title": f"{m2['title']} YES",
+                            "market2_price": m2_yes_ask,
+                            "total_cost": total,
+                            "total_fees": total_fees,
+                            "gross_profit": gross,
+                            "net_profit": net,
+                            "net_arb_percent": net_pct,
+                            "profit_cents": net,
+                            "arb_percent": net_pct,
+                            "available_qty": available_qty,
+                        }
+                        signals.append(sig)
+                        log_signal(
+                            event_ticker=event_ticker,
+                            event_title=event_title,
+                            market1_ticker=m1["ticker"],
+                            market1_title=f"{m1['title']} YES",
+                            market1_yes_price=m1_yes_ask,
+                            market2_ticker=m2["ticker"],
+                            market2_title=f"{m2['title']} YES",
+                            market2_yes_price=m2_yes_ask,
+                            total_cost_cents=total,
+                            arb_profit_cents=net,
+                            arb_percent=net_pct,
+                            arb_type="cross_market_yes",
+                        )
+                        logger.info(
+                            "ARB YES+YES: %s@%d¢ + %s@%d¢ = %d¢ | fees %d¢ | net %d¢ (%.2f%%) | qty %d",
+                            m1["title"], m1_yes_ask, m2["title"], m2_yes_ask,
+                            total, total_fees, net, net_pct, available_qty,
+                        )
 
-        m1_no_ask = get_best_no_ask(m1_ob.get("yes", []))
-        m2_no_ask = get_best_no_ask(m2_ob.get("yes", []))
+    m1_no_ask, m1_nq = get_best_no_ask_with_qty(m1_ob.get("yes", []))
+    m2_no_ask, m2_nq = get_best_no_ask_with_qty(m2_ob.get("yes", []))
 
-        if m1_no_ask is not None and m2_no_ask is not None:
+    if m1_no_ask is not None and m2_no_ask is not None:
+        if m1_no_ask > 0 and m2_no_ask > 0:
             total = m1_no_ask + m2_no_ask
             if total < 100:
-                profit = 100 - total
-                arb_pct = (profit / total) * 100
-                if arb_pct >= min_arb_percent:
-                    sig = {
-                        "type": "cross_market_no",
-                        "event_ticker": event_ticker,
-                        "event_title": event_title,
-                        "market1_ticker": m1["ticker"],
-                        "market1_title": f"{m1['title']} NO",
-                        "market1_price": m1_no_ask,
-                        "market2_ticker": m2["ticker"],
-                        "market2_title": f"{m2['title']} NO",
-                        "market2_price": m2_no_ask,
-                        "total_cost": total,
-                        "profit_cents": profit,
-                        "arb_percent": arb_pct,
-                    }
-                    signals.append(sig)
-                    log_signal(
-                        event_ticker=event_ticker,
-                        event_title=event_title,
-                        market1_ticker=m1["ticker"],
-                        market1_title=f"{m1['title']} NO",
-                        market1_yes_price=m1_no_ask,
-                        market2_ticker=m2["ticker"],
-                        market2_title=f"{m2['title']} NO",
-                        market2_yes_price=m2_no_ask,
-                        total_cost_cents=total,
-                        arb_profit_cents=profit,
-                        arb_percent=arb_pct,
-                        arb_type="cross_market_no",
-                    )
-                    logger.info(
-                        "2-MARKET ARB (NO+NO): %s@%d¢ + %s@%d¢ = %d¢ | profit %d¢ (%.2f%%)",
-                        m1["title"], m1_no_ask, m2["title"], m2_no_ask, total, profit, arb_pct,
-                    )
-
-        return signals
-
-    yes_asks = []
-    for m in markets_with_orderbooks:
-        ask = get_best_yes_ask(m["orderbook"].get("no", []))
-        if ask is not None:
-            yes_asks.append((m, ask))
-
-    if len(yes_asks) == n_markets:
-        total_all_yes = sum(a for _, a in yes_asks)
-        if total_all_yes < 100:
-            profit = 100 - total_all_yes
-            arb_pct = (profit / total_all_yes) * 100
-            if arb_pct >= min_arb_percent:
-                detail = " + ".join(
-                    f"{m['title']}@{p}¢" for m, p in yes_asks
-                )
-
-                sig = {
-                    "type": "multi_market_all_yes",
-                    "event_ticker": event_ticker,
-                    "event_title": event_title,
-                    "market1_ticker": "ALL",
-                    "market1_title": f"Buy YES on all {n_markets} markets",
-                    "market1_price": total_all_yes,
-                    "market2_ticker": "ALL",
-                    "market2_title": detail,
-                    "market2_price": 0,
-                    "total_cost": total_all_yes,
-                    "profit_cents": profit,
-                    "arb_percent": arb_pct,
-                }
-                signals.append(sig)
-
-                log_signal(
-                    event_ticker=event_ticker,
-                    event_title=event_title,
-                    market1_ticker="ALL",
-                    market1_title=f"All {n_markets} YES",
-                    market1_yes_price=total_all_yes,
-                    market2_ticker="ALL",
-                    market2_title=detail,
-                    market2_yes_price=0,
-                    total_cost_cents=total_all_yes,
-                    arb_profit_cents=profit,
-                    arb_percent=arb_pct,
-                    arb_type="multi_market_all_yes",
-                )
-
-                logger.info(
-                    "MULTI-MARKET ARB (ALL %d YES): %s = %d¢ | profit %d¢ (%.2f%%)",
-                    n_markets, detail, total_all_yes, profit, arb_pct,
-                )
+                fee1 = taker_fee_cents(m1_no_ask)
+                fee2 = taker_fee_cents(m2_no_ask)
+                total_fees = fee1 + fee2
+                gross = 100 - total
+                net = gross - total_fees
+                if net > 0:
+                    net_pct = (net / (total + total_fees)) * 100
+                    if net_pct >= min_arb_percent:
+                        available_qty = min(m1_nq, m2_nq)
+                        sig = {
+                            "type": "cross_market_no",
+                            "event_ticker": event_ticker,
+                            "event_title": event_title,
+                            "market1_ticker": m1["ticker"],
+                            "market1_title": f"{m1['title']} NO",
+                            "market1_price": m1_no_ask,
+                            "market2_ticker": m2["ticker"],
+                            "market2_title": f"{m2['title']} NO",
+                            "market2_price": m2_no_ask,
+                            "total_cost": total,
+                            "total_fees": total_fees,
+                            "gross_profit": gross,
+                            "net_profit": net,
+                            "net_arb_percent": net_pct,
+                            "profit_cents": net,
+                            "arb_percent": net_pct,
+                            "available_qty": available_qty,
+                        }
+                        signals.append(sig)
+                        log_signal(
+                            event_ticker=event_ticker,
+                            event_title=event_title,
+                            market1_ticker=m1["ticker"],
+                            market1_title=f"{m1['title']} NO",
+                            market1_yes_price=m1_no_ask,
+                            market2_ticker=m2["ticker"],
+                            market2_title=f"{m2['title']} NO",
+                            market2_yes_price=m2_no_ask,
+                            total_cost_cents=total,
+                            arb_profit_cents=net,
+                            arb_percent=net_pct,
+                            arb_type="cross_market_no",
+                        )
+                        logger.info(
+                            "ARB NO+NO: %s@%d¢ + %s@%d¢ = %d¢ | fees %d¢ | net %d¢ (%.2f%%) | qty %d",
+                            m1["title"], m1_no_ask, m2["title"], m2_no_ask,
+                            total, total_fees, net, net_pct, available_qty,
+                        )
 
     return signals
 
