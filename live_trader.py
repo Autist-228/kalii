@@ -9,6 +9,8 @@ from kalshi_client import KalshiClient
 logger = logging.getLogger("live_trader")
 
 EVENT_COOLDOWN_SEC = 60
+ORDER_MONITOR_INTERVAL = 3
+ORDER_TIMEOUT_SEC = 60
 
 
 class LiveTrader:
@@ -90,8 +92,16 @@ class LiveTrader:
         leg1_price = signal["market1_price"]
         leg2_price = signal["market2_price"]
 
-        logger.info("PLACING LEG 1: %s %s BUY @ %d¢ x%d",
+        logger.info("PLACING BOTH LEGS as GTC resting orders:")
+        logger.info("  LEG 1: %s %s BUY @ %d¢ x%d",
                      leg1_ticker, leg1_side.upper(), leg1_price, contracts)
+        logger.info("  LEG 2: %s %s BUY @ %d¢ x%d",
+                     leg2_ticker, leg2_side.upper(), leg2_price, contracts)
+
+        leg1_order = {}
+        leg2_order = {}
+        leg1_order_id = ""
+        leg2_order_id = ""
 
         try:
             leg1_resp = self.client.place_order(
@@ -100,28 +110,16 @@ class LiveTrader:
                 action="buy",
                 count=contracts,
                 price=leg1_price,
-                time_in_force="immediate_or_cancel",
+                time_in_force="good_till_canceled",
             )
             leg1_order = leg1_resp.get("order", {})
-            leg1_status = leg1_order.get("status", "")
-            leg1_filled = leg1_order.get("fill_count", 0)
-
-            logger.info("LEG 1 RESULT: status=%s filled=%d/%d fees=%d¢",
-                         leg1_status, leg1_filled, contracts,
-                         leg1_order.get("taker_fees", 0))
-
-            if leg1_filled == 0:
-                logger.warning("LEG 1 NOT FILLED — aborting")
-                return None
-
-            contracts = leg1_filled
-
+            leg1_order_id = leg1_order.get("order_id", "")
+            logger.info("LEG 1 PLACED: id=%s status=%s filled=%d/%d",
+                         leg1_order_id, leg1_order.get("status", ""),
+                         leg1_order.get("fill_count", 0), contracts)
         except Exception as e:
-            logger.error("LEG 1 FAILED: %s", e)
+            logger.error("LEG 1 PLACE FAILED: %s", e)
             return None
-
-        logger.info("PLACING LEG 2: %s %s BUY @ %d¢ x%d",
-                     leg2_ticker, leg2_side.upper(), leg2_price, contracts)
 
         try:
             leg2_resp = self.client.place_order(
@@ -130,38 +128,69 @@ class LiveTrader:
                 action="buy",
                 count=contracts,
                 price=leg2_price,
-                time_in_force="immediate_or_cancel",
+                time_in_force="good_till_canceled",
             )
             leg2_order = leg2_resp.get("order", {})
-            leg2_status = leg2_order.get("status", "")
-            leg2_filled = leg2_order.get("fill_count", 0)
-
-            logger.info("LEG 2 RESULT: status=%s filled=%d/%d fees=%d¢",
-                         leg2_status, leg2_filled, contracts,
-                         leg2_order.get("taker_fees", 0))
-
-            if leg2_filled == 0:
-                logger.warning("LEG 2 NOT FILLED — emergency selling leg 1")
-                self._emergency_sell(leg1_ticker, leg1_side, contracts)
-                return None
-
-            if leg2_filled < contracts:
-                excess = contracts - leg2_filled
-                logger.warning("LEG 2 PARTIAL %d/%d — selling %d excess leg 1",
-                               leg2_filled, contracts, excess)
-                self._emergency_sell(leg1_ticker, leg1_side, excess)
-                contracts = leg2_filled
-
+            leg2_order_id = leg2_order.get("order_id", "")
+            logger.info("LEG 2 PLACED: id=%s status=%s filled=%d/%d",
+                         leg2_order_id, leg2_order.get("status", ""),
+                         leg2_order.get("fill_count", 0), contracts)
         except Exception as e:
-            logger.error("LEG 2 FAILED: %s — emergency selling leg 1", e)
-            self._emergency_sell(leg1_ticker, leg1_side, contracts)
+            logger.error("LEG 2 PLACE FAILED: %s — canceling leg 1", e)
+            self._cancel_order_safe(leg1_order_id)
             return None
 
-        leg1_fees = leg1_order.get("taker_fees", 0)
-        leg2_fees = leg2_order.get("taker_fees", 0)
+        leg1_filled = leg1_order.get("fill_count", 0)
+        leg2_filled = leg2_order.get("fill_count", 0)
+
+        if leg1_filled >= contracts and leg2_filled >= contracts:
+            logger.info("BOTH LEGS FILLED INSTANTLY!")
+        else:
+            leg1_filled, leg2_filled = self._monitor_orders(
+                leg1_order_id, leg2_order_id, contracts
+            )
+
+        if leg1_filled == 0 and leg2_filled == 0:
+            logger.warning("NEITHER LEG FILLED after %ds — canceling both", ORDER_TIMEOUT_SEC)
+            self._cancel_order_safe(leg1_order_id)
+            self._cancel_order_safe(leg2_order_id)
+            self.skipped_no_liquidity += 1
+            return None
+
+        matched = min(leg1_filled, leg2_filled)
+
+        if matched == 0:
+            if leg1_filled > 0:
+                logger.warning("ONLY LEG 1 FILLED (%d) — canceling leg 2, emergency selling leg 1", leg1_filled)
+                self._cancel_order_safe(leg2_order_id)
+                self._emergency_sell(leg1_ticker, leg1_side, leg1_filled)
+            else:
+                logger.warning("ONLY LEG 2 FILLED (%d) — canceling leg 1, emergency selling leg 2", leg2_filled)
+                self._cancel_order_safe(leg1_order_id)
+                self._emergency_sell(leg2_ticker, leg2_side, leg2_filled)
+            return None
+
+        if leg1_filled > matched:
+            excess = leg1_filled - matched
+            logger.warning("LEG 1 has %d excess — selling", excess)
+            self._emergency_sell(leg1_ticker, leg1_side, excess)
+        if leg2_filled > matched:
+            excess = leg2_filled - matched
+            logger.warning("LEG 2 has %d excess — selling", excess)
+            self._emergency_sell(leg2_ticker, leg2_side, excess)
+
+        if leg1_filled < contracts:
+            self._cancel_order_safe(leg1_order_id)
+        if leg2_filled < contracts:
+            self._cancel_order_safe(leg2_order_id)
+
+        leg1_order_final = self._get_order_safe(leg1_order_id)
+        leg2_order_final = self._get_order_safe(leg2_order_id)
+        leg1_fees = leg1_order_final.get("taker_fees", 0)
+        leg2_fees = leg2_order_final.get("taker_fees", 0)
         total_fees = leg1_fees + leg2_fees
-        leg1_cost = leg1_order.get("taker_fill_cost", leg1_price * contracts)
-        leg2_cost = leg2_order.get("taker_fill_cost", leg2_price * contracts)
+        leg1_cost = leg1_order_final.get("taker_fill_cost", leg1_price * matched)
+        leg2_cost = leg2_order_final.get("taker_fill_cost", leg2_price * matched)
         total_cost = leg1_cost + leg2_cost
 
         self._refresh_balance()
@@ -177,15 +206,15 @@ class LiveTrader:
             "leg1_ticker": leg1_ticker,
             "leg1_side": leg1_side,
             "leg1_price": leg1_price,
-            "leg1_order_id": leg1_order.get("order_id", ""),
+            "leg1_order_id": leg1_order_id,
             "leg2_ticker": leg2_ticker,
             "leg2_side": leg2_side,
             "leg2_price": leg2_price,
-            "leg2_order_id": leg2_order.get("order_id", ""),
-            "contracts": contracts,
+            "leg2_order_id": leg2_order_id,
+            "contracts": matched,
             "total_cost": total_cost,
             "total_fees": total_fees,
-            "net_profit_expected": contracts * net_profit_per,
+            "net_profit_expected": matched * net_profit_per,
             "net_arb_percent": signal.get("net_arb_percent", 0),
             "status": "open",
         }
@@ -194,11 +223,53 @@ class LiveTrader:
 
         logger.info(
             "LIVE BUY OK: %s | %d contracts | cost %d¢ + %d¢ fees | expected +%d¢ | balance %d¢",
-            event_ticker, contracts, total_cost, total_fees,
+            event_ticker, matched, total_cost, total_fees,
             position["net_profit_expected"], self.balance,
         )
 
         return position
+
+    def _monitor_orders(
+        self, leg1_id: str, leg2_id: str, target: int
+    ) -> tuple[int, int]:
+        start = time.time()
+        leg1_filled = 0
+        leg2_filled = 0
+        while time.time() - start < ORDER_TIMEOUT_SEC:
+            time.sleep(ORDER_MONITOR_INTERVAL)
+            try:
+                o1 = self._get_order_safe(leg1_id)
+                o2 = self._get_order_safe(leg2_id)
+                leg1_filled = o1.get("fill_count", 0)
+                leg2_filled = o2.get("fill_count", 0)
+                elapsed = int(time.time() - start)
+                logger.info("ORDER MONITOR [%ds]: leg1 %d/%d  leg2 %d/%d",
+                             elapsed, leg1_filled, target, leg2_filled, target)
+                if leg1_filled >= target and leg2_filled >= target:
+                    logger.info("BOTH LEGS FULLY FILLED!")
+                    return leg1_filled, leg2_filled
+            except Exception as e:
+                logger.error("Monitor poll error: %s", e)
+        return leg1_filled, leg2_filled
+
+    def _get_order_safe(self, order_id: str) -> dict:
+        if not order_id:
+            return {}
+        try:
+            data = self.client.get_order(order_id)
+            return data.get("order", {})
+        except Exception as e:
+            logger.error("get_order(%s) failed: %s", order_id, e)
+            return {}
+
+    def _cancel_order_safe(self, order_id: str):
+        if not order_id:
+            return
+        try:
+            self.client.cancel_order(order_id)
+            logger.info("Canceled order %s", order_id)
+        except Exception as e:
+            logger.warning("Cancel order %s failed (may already be filled/canceled): %s", order_id, e)
 
     def _emergency_sell(self, ticker: str, side: str, count: int):
         logger.warning("EMERGENCY SELL: %s %s x%d", ticker, side, count)
