@@ -12,6 +12,7 @@ from config import (
     BANKROLL_CENTS,
     BET_PERCENT,
     ALLOWED_CATEGORIES,
+    EVENT_CACHE_SEC,
 )
 from kalshi_client import KalshiClient
 from kalshi_ws import KalshiWebSocket
@@ -39,6 +40,8 @@ class ArbBot:
         self.total_signals = 0
         self.scan_count = 0
         self.start_time = time.time()
+        self._cached_events: dict[str, dict] = {}
+        self._events_fetched_at: float = 0
 
     def fetch_orderbook(self, ticker: str) -> tuple[str, dict]:
         try:
@@ -97,17 +100,33 @@ class ArbBot:
             m1, m2 = event_data["markets"]
             ya1 = m1.get("yes_ask")
             ya2 = m2.get("yes_ask")
-            if ya1 is None or ya2 is None:
-                continue
-            if ya1 <= 0 or ya2 <= 0:
-                continue
-            if ya1 + ya2 <= 102:
+            na1 = m1.get("no_ask")
+            na2 = m2.get("no_ask")
+
+            yes_sum_ok = False
+            if ya1 and ya2 and ya1 > 0 and ya2 > 0:
+                yes_sum_ok = ya1 + ya2 <= 105
+
+            no_sum_ok = False
+            if na1 and na2 and na1 > 0 and na2 > 0:
+                no_sum_ok = na1 + na2 <= 105
+
+            missing_data = (ya1 is None or ya1 <= 0 or ya2 is None or ya2 <= 0)
+
+            if yes_sum_ok or no_sum_ok or missing_data:
                 candidates[event_ticker] = event_data
         return candidates
 
     def scan_all_events_rest(self) -> list[dict]:
         self.scan_count += 1
-        events = self.discover_2market_events()
+        now = time.time()
+        if not self._cached_events or (now - self._events_fetched_at) >= EVENT_CACHE_SEC:
+            self._cached_events = self.discover_2market_events()
+            self._events_fetched_at = now
+        else:
+            logger.info("Using cached event list (%d events, %.0fs old)",
+                        len(self._cached_events), now - self._events_fetched_at)
+        events = self._cached_events
 
         if not events:
             logger.info("No 2-market events found.")
@@ -234,21 +253,84 @@ async def run_ws_scanner(bot: ArbBot, duration_sec: int = 0):
     ticker_prices: dict[str, dict] = {}
     start = time.time()
 
+    def _make_ws_signal(arb_type: str, event_ticker: str, t1: str, t2: str,
+                        label1: str, label2: str, p1: int, p2: int,
+                        total: int, total_fees: int, gross: int, net: int, net_pct: float):
+        m1_info = bot.market_info.get(t1, {})
+        m2_info = bot.market_info.get(t2, {})
+        sig = {
+            "type": arb_type,
+            "event_ticker": event_ticker,
+            "event_title": m1_info.get("event_title", event_ticker),
+            "market1_ticker": t1,
+            "market1_title": f"{m1_info.get('title', t1)} {label1}",
+            "market1_price": p1,
+            "market2_ticker": t2,
+            "market2_title": f"{m2_info.get('title', t2)} {label2}",
+            "market2_price": p2,
+            "total_cost": total,
+            "total_fees": total_fees,
+            "gross_profit": gross,
+            "net_profit": net,
+            "net_arb_percent": net_pct,
+            "profit_cents": net,
+            "arb_percent": net_pct,
+            "available_qty": 999,
+        }
+        log_signal(
+            event_ticker=event_ticker,
+            event_title=m1_info.get("event_title", event_ticker),
+            market1_ticker=t1,
+            market1_title=f"{m1_info.get('title', t1)} {label1}",
+            market1_yes_price=p1,
+            market2_ticker=t2,
+            market2_title=f"{m2_info.get('title', t2)} {label2}",
+            market2_yes_price=p2,
+            total_cost_cents=total,
+            arb_profit_cents=net,
+            arb_percent=net_pct,
+            arb_type=arb_type,
+        )
+        bot.total_signals += 1
+        bot.print_signal(sig)
+        bot.paper_trader.execute_paper_trade(sig)
+
+    def _check_pair(arb_type: str, event_ticker: str,
+                    t1: str, t2: str, label1: str, label2: str,
+                    p1: int, p2: int):
+        total = p1 + p2
+        if total >= 100:
+            return
+        fee1 = taker_fee_cents(p1)
+        fee2 = taker_fee_cents(p2)
+        total_fees = fee1 + fee2
+        gross = 100 - total
+        net = gross - total_fees
+        if net <= 0:
+            return
+        net_pct = (net / (total + total_fees)) * 100
+        if net_pct < MIN_ARB_PERCENT:
+            return
+        _make_ws_signal(arb_type, event_ticker, t1, t2, label1, label2,
+                        p1, p2, total, total_fees, gross, net, net_pct)
+
     async def on_ticker(msg: dict):
         ticker = msg.get("market_ticker", "")
         yes_ask = msg.get("yes_ask")
         no_ask = msg.get("no_ask")
-
         yes_bid = msg.get("yes_bid")
+        no_bid = msg.get("no_bid")
 
-        if yes_ask is not None or yes_bid is not None:
-            existing = ticker_prices.get(ticker, {})
-            if yes_ask is not None:
-                existing["yes_ask"] = yes_ask
-                existing["no_ask"] = no_ask
-            if yes_bid is not None:
-                existing["yes_bid"] = yes_bid
-            ticker_prices[ticker] = existing
+        existing = ticker_prices.get(ticker, {})
+        if yes_ask is not None:
+            existing["yes_ask"] = yes_ask
+        if no_ask is not None:
+            existing["no_ask"] = no_ask
+        if yes_bid is not None:
+            existing["yes_bid"] = yes_bid
+        if no_bid is not None:
+            existing["no_bid"] = no_bid
+        ticker_prices[ticker] = existing
 
         info = bot.market_info.get(ticker)
         if not info:
@@ -263,85 +345,36 @@ async def run_ws_scanner(bot: ArbBot, duration_sec: int = 0):
         if len(event_markets) != 2:
             return
 
-        yes_asks = []
+        t1, t2 = event_markets[0], event_markets[1]
+        tp1 = ticker_prices.get(t1, {})
+        tp2 = ticker_prices.get(t2, {})
+
+        ya1 = tp1.get("yes_ask")
+        ya2 = tp2.get("yes_ask")
+        if ya1 and ya2 and ya1 > 0 and ya2 > 0:
+            _check_pair("ws_cross_yes", event_ticker, t1, t2, "YES", "YES", ya1, ya2)
+
+        na1 = tp1.get("no_ask")
+        na2 = tp2.get("no_ask")
+        if na1 and na2 and na1 > 0 and na2 > 0:
+            _check_pair("ws_cross_no", event_ticker, t1, t2, "NO", "NO", na1, na2)
+
+        for t, tp in [(t1, tp1), (t2, tp2)]:
+            ya = tp.get("yes_ask")
+            na = tp.get("no_ask")
+            if ya and na and ya > 0 and na > 0:
+                _check_pair("ws_yes_no", event_ticker, t, t, "YES", "NO", ya, na)
+
+        bid_data = {}
         for t in event_markets:
             tp = ticker_prices.get(t, {})
-            ya = tp.get("yes_ask")
-            if ya is not None and ya > 0:
-                yes_asks.append((t, ya))
-
-        if len(yes_asks) != 2:
-            return
-
-        t1, a1 = yes_asks[0]
-        t2, a2 = yes_asks[1]
-        total = a1 + a2
-        if total >= 100:
-            return
-
-        fee1 = taker_fee_cents(a1)
-        fee2 = taker_fee_cents(a2)
-        total_fees = fee1 + fee2
-        gross = 100 - total
-        net = gross - total_fees
-
-        if net <= 0:
-            return
-
-        net_pct = (net / (total + total_fees)) * 100
-        if net_pct < MIN_ARB_PERCENT:
-            return
-
-        m1_info = bot.market_info.get(t1, {})
-        m2_info = bot.market_info.get(t2, {})
-        sig = {
-            "type": "ws_cross_market_yes",
-            "event_ticker": event_ticker,
-            "event_title": m1_info.get("event_title", event_ticker),
-            "market1_ticker": t1,
-            "market1_title": f"{m1_info.get('title', t1)} YES",
-            "market1_price": a1,
-            "market2_ticker": t2,
-            "market2_title": f"{m2_info.get('title', t2)} YES",
-            "market2_price": a2,
-            "total_cost": total,
-            "total_fees": total_fees,
-            "gross_profit": gross,
-            "net_profit": net,
-            "net_arb_percent": net_pct,
-            "profit_cents": net,
-            "arb_percent": net_pct,
-            "available_qty": 1,
-        }
-        log_signal(
-            event_ticker=event_ticker,
-            event_title=m1_info.get("event_title", event_ticker),
-            market1_ticker=t1,
-            market1_title=f"{m1_info.get('title', t1)} YES",
-            market1_yes_price=a1,
-            market2_ticker=t2,
-            market2_title=f"{m2_info.get('title', t2)} YES",
-            market2_yes_price=a2,
-            total_cost_cents=total,
-            arb_profit_cents=net,
-            arb_percent=net_pct,
-            arb_type="ws_cross_market_yes",
-        )
-        bot.total_signals += 1
-        bot.print_signal(sig)
-        bot.paper_trader.execute_paper_trade(sig)
-
-        if ticker in ticker_prices:
-            bid_data = {}
-            for t in event_markets:
-                tp = ticker_prices.get(t, {})
-                yes_bid = tp.get("yes_bid", 0)
-                if yes_bid and yes_bid > 0:
-                    bid_data[t] = {"bid": yes_bid}
-            if bid_data:
-                exit_result = bot.paper_trader.check_exit_ws(ticker, bid_data)
-                if exit_result:
-                    bot.print_exit(exit_result)
+            yb = tp.get("yes_bid", 0)
+            if yb and yb > 0:
+                bid_data[t] = {"bid": yb}
+        if bid_data:
+            exit_result = bot.paper_trader.check_exit_ws(ticker, bid_data)
+            if exit_result:
+                bot.print_exit(exit_result)
 
     ws.on_ticker = on_ticker
 
