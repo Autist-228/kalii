@@ -158,11 +158,17 @@ class ArbBot:
                     self.paper_trader.execute_paper_trade(sig)
                     all_signals.append(sig)
 
+        exits = self.paper_trader.check_exits_with_orderbooks(self.orderbook_cache)
+        for ex in exits:
+            self.print_exit(ex)
+
         elapsed = time.time() - self.start_time
+        open_ct = len(self.paper_trader.open_positions)
+        closed_ct = len(self.paper_trader.closed_positions)
         logger.info(
-            "Scan #%d done | %d candidates | %d signals this scan | %d total | %.0fs elapsed | balance %d¢",
-            self.scan_count, len(candidates), len(all_signals),
-            self.total_signals, elapsed, self.paper_trader.balance,
+            "Scan #%d done | %d candidates | %d signals | %d exits | open %d | closed %d | %.0fs elapsed | balance %d¢",
+            self.scan_count, len(candidates), len(all_signals), len(exits),
+            open_ct, closed_ct, elapsed, self.paper_trader.balance,
         )
 
         return all_signals
@@ -190,6 +196,17 @@ class ArbBot:
         print(f"  Paper:    {contracts} contracts → +{expected}¢")
         print("=" * 70 + "\n")
 
+    def print_exit(self, pos: dict):
+        print("\n" + "*" * 70)
+        print(f"{'POSITION SOLD':^70}")
+        print("*" * 70)
+        print(f"  Event:    {pos['event_title']}")
+        print(f"  Bought:   {pos['leg1_ticker']} {pos['leg1_side']}@{pos['leg1_price']}¢ + {pos['leg2_ticker']} {pos['leg2_side']}@{pos['leg2_price']}¢")
+        print(f"  Sold:     @{pos.get('sell_leg1_price', '?')}¢ + @{pos.get('sell_leg2_price', '?')}¢")
+        print(f"  Profit:   +{pos.get('exit_profit', 0)}¢ ({pos['contracts']} contracts)")
+        print(f"  Balance:  {self.paper_trader.balance}¢")
+        print("*" * 70 + "\n")
+
 
 async def run_rest_scanner(bot: ArbBot, duration_sec: int = 0):
     logger.info("Starting REST scanner (interval=%ds)...", SCAN_INTERVAL_SEC)
@@ -215,8 +232,16 @@ async def run_ws_scanner(bot: ArbBot, duration_sec: int = 0):
         yes_ask = msg.get("yes_ask")
         no_ask = msg.get("no_ask")
 
-        if yes_ask is not None:
-            ticker_prices[ticker] = {"yes_ask": yes_ask, "no_ask": no_ask}
+        yes_bid = msg.get("yes_bid")
+
+        if yes_ask is not None or yes_bid is not None:
+            existing = ticker_prices.get(ticker, {})
+            if yes_ask is not None:
+                existing["yes_ask"] = yes_ask
+                existing["no_ask"] = no_ask
+            if yes_bid is not None:
+                existing["yes_bid"] = yes_bid
+            ticker_prices[ticker] = existing
 
         info = bot.market_info.get(ticker)
         if not info:
@@ -299,8 +324,17 @@ async def run_ws_scanner(bot: ArbBot, duration_sec: int = 0):
         bot.print_signal(sig)
         bot.paper_trader.execute_paper_trade(sig)
 
-        bot.paper_trader.check_early_exit(t1, a1)
-        bot.paper_trader.check_early_exit(t2, a2)
+        if ticker in ticker_prices:
+            bid_data = {}
+            for t in event_markets:
+                tp = ticker_prices.get(t, {})
+                yes_bid = tp.get("yes_bid", 0)
+                if yes_bid and yes_bid > 0:
+                    bid_data[t] = {"bid": yes_bid}
+            if bid_data:
+                exit_result = bot.paper_trader.check_exit_ws(ticker, bid_data)
+                if exit_result:
+                    bot.print_exit(exit_result)
 
     ws.on_ticker = on_ticker
 

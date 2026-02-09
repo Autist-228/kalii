@@ -103,22 +103,94 @@ class PaperTrader:
 
         return position
 
-    def check_early_exit(self, ticker: str, current_yes_bid: int) -> Optional[dict]:
-        for pos in self.open_positions:
-            if pos["leg1_ticker"] == ticker or pos["leg2_ticker"] == ticker:
-                if pos["leg1_ticker"] == ticker:
-                    buy_price = pos["leg1_price"]
-                else:
-                    buy_price = pos["leg2_price"]
+    def try_paired_exit(self, position: dict, leg1_bid: int, leg2_bid: int) -> Optional[dict]:
+        if leg1_bid <= 0 or leg2_bid <= 0:
+            return None
 
-                if current_yes_bid > buy_price:
-                    sell_fee = taker_fee_cents(current_yes_bid)
-                    sell_profit_per = current_yes_bid - buy_price - sell_fee
-                    if sell_profit_per > 0:
-                        logger.info(
-                            "EARLY EXIT OPPORTUNITY: %s | bought@%d¢ sell@%d¢ | +%d¢/contract",
-                            ticker, buy_price, current_yes_bid, sell_profit_per,
-                        )
+        contracts = position["contracts"]
+        sell_revenue_per = leg1_bid + leg2_bid
+        sell_fee1 = taker_fee_cents(leg1_bid)
+        sell_fee2 = taker_fee_cents(leg2_bid)
+        total_sell_fees_per = sell_fee1 + sell_fee2
+
+        net_sell_per = sell_revenue_per - total_sell_fees_per
+        buy_cost_per = (position["total_cost"] + position["total_fees"]) // contracts
+
+        exit_profit_per = net_sell_per - buy_cost_per
+
+        if exit_profit_per < 0:
+            return None
+
+        net_sell_total = net_sell_per * contracts
+        exit_profit_total = exit_profit_per * contracts
+        sell_fees_total = total_sell_fees_per * contracts
+
+        self.balance += net_sell_total
+        self.total_profit += exit_profit_total
+        self.total_fees_paid += sell_fees_total
+
+        position["status"] = "sold"
+        position["exit_profit"] = exit_profit_total
+        position["exit_type"] = "paired_sell"
+        position["exit_timestamp"] = datetime.datetime.utcnow().isoformat()
+        position["sell_leg1_price"] = leg1_bid
+        position["sell_leg2_price"] = leg2_bid
+        position["sell_fees"] = sell_fees_total
+
+        self.open_positions.remove(position)
+        self.closed_positions.append(position)
+
+        self._update_paper_trade_exit(position)
+
+        logger.info(
+            "PAPER SELL: %s | %d contracts | sell %d¢+%d¢ - %d¢ fees = %d¢ | profit +%d¢ | balance %d¢",
+            position["event_ticker"], contracts,
+            leg1_bid, leg2_bid, sell_fees_total, net_sell_total,
+            exit_profit_total, self.balance,
+        )
+
+        return position
+
+    def check_exits_with_orderbooks(self, orderbooks: dict) -> list[dict]:
+        exits = []
+        for pos in list(self.open_positions):
+            leg1_ob = orderbooks.get(pos["leg1_ticker"], {})
+            leg2_ob = orderbooks.get(pos["leg2_ticker"], {})
+
+            if pos["leg1_side"] == "yes":
+                leg1_bids = leg1_ob.get("yes", [])
+            else:
+                leg1_bids = leg1_ob.get("no", [])
+
+            if pos["leg2_side"] == "yes":
+                leg2_bids = leg2_ob.get("yes", [])
+            else:
+                leg2_bids = leg2_ob.get("no", [])
+
+            leg1_bid = leg1_bids[-1][0] if leg1_bids else 0
+            leg2_bid = leg2_bids[-1][0] if leg2_bids else 0
+
+            result = self.try_paired_exit(pos, leg1_bid, leg2_bid)
+            if result:
+                exits.append(result)
+
+        return exits
+
+    def check_exit_ws(self, ticker: str, bid_prices: dict) -> Optional[dict]:
+        for pos in list(self.open_positions):
+            if pos["leg1_ticker"] != ticker and pos["leg2_ticker"] != ticker:
+                continue
+
+            leg1_bid = bid_prices.get(pos["leg1_ticker"], {}).get("bid", 0)
+            leg2_bid = bid_prices.get(pos["leg2_ticker"], {}).get("bid", 0)
+
+            if leg1_bid <= 0 or leg2_bid <= 0:
+                continue
+
+            result = self.try_paired_exit(pos, leg1_bid, leg2_bid)
+            if result:
+                return result
+
         return None
 
     def settle_position(self, event_ticker: str, winning_ticker: str):
@@ -135,6 +207,8 @@ class PaperTrader:
             self.total_profit += profit
             self.open_positions.remove(pos)
             self.closed_positions.append(pos)
+
+            self._update_paper_trade_exit(pos)
 
             logger.info(
                 "SETTLED: %s | payout %d¢ | profit %d¢ | balance %d¢",
@@ -194,6 +268,26 @@ class PaperTrader:
                 print(f"    Expected profit: +{pos['net_profit_expected']}¢")
             print("-" * 60)
         print()
+
+    def _update_paper_trade_exit(self, position: dict):
+        try:
+            conn = get_connection()
+            conn.execute("""
+                UPDATE paper_trades
+                SET status = ?, exit_timestamp = ?, exit_profit_cents = ?, exit_type = ?
+                WHERE event_ticker = ? AND status = 'open'
+                ORDER BY id DESC LIMIT 1
+            """, (
+                position["status"],
+                position.get("exit_timestamp", ""),
+                position.get("exit_profit", 0),
+                position.get("exit_type", ""),
+                position["event_ticker"],
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error("Failed to update paper trade exit: %s", e)
 
     def _log_paper_trade(self, position: dict):
         try:
