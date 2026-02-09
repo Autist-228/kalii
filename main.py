@@ -13,11 +13,13 @@ from config import (
     BET_PERCENT,
     ALLOWED_CATEGORIES,
     EVENT_CACHE_SEC,
+    LIVE_MODE,
 )
 from kalshi_client import KalshiClient
 from kalshi_ws import KalshiWebSocket
 from arbitrage_scanner import scan_event_for_arb, taker_fee_cents
 from paper_trader import PaperTrader
+from live_trader import LiveTrader
 from db import init_db, log_signal
 
 logging.basicConfig(
@@ -32,9 +34,9 @@ logger = logging.getLogger("main")
 
 
 class ArbBot:
-    def __init__(self, paper_trader: PaperTrader):
+    def __init__(self, trader):
         self.client = KalshiClient()
-        self.paper_trader = paper_trader
+        self.trader = trader
         self.orderbook_cache: dict[str, dict] = {}
         self.market_info: dict[str, dict] = {}
         self.total_signals = 0
@@ -42,6 +44,10 @@ class ArbBot:
         self.start_time = time.time()
         self._cached_events: dict[str, dict] = {}
         self._events_fetched_at: float = 0
+
+    @property
+    def paper_trader(self):
+        return self.trader
 
     def fetch_orderbook(self, ticker: str) -> tuple[str, dict]:
         try:
@@ -181,20 +187,20 @@ class ArbBot:
                 for sig in signals:
                     self.total_signals += 1
                     self.print_signal(sig)
-                    self.paper_trader.execute_paper_trade(sig)
+                    self.trader.execute_paper_trade(sig)
                     all_signals.append(sig)
 
-        exits = self.paper_trader.check_exits_with_orderbooks(self.orderbook_cache)
+        exits = self.trader.check_exits_with_orderbooks(self.orderbook_cache)
         for ex in exits:
             self.print_exit(ex)
 
         elapsed = time.time() - self.start_time
-        open_ct = len(self.paper_trader.open_positions)
-        closed_ct = len(self.paper_trader.closed_positions)
+        open_ct = len(self.trader.open_positions)
+        closed_ct = len(self.trader.closed_positions)
         logger.info(
             "Scan #%d done | %d candidates | %d signals | %d exits | open %d | closed %d | %.0fs elapsed | balance %d¢",
             self.scan_count, len(candidates), len(all_signals), len(exits),
-            open_ct, closed_ct, elapsed, self.paper_trader.balance,
+            open_ct, closed_ct, elapsed, self.trader.balance,
         )
 
         return all_signals
@@ -206,7 +212,7 @@ class ArbBot:
         pct = sig.get("net_arb_percent", sig["arb_percent"])
         qty = sig.get("available_qty", 0)
 
-        bet_size = self.paper_trader.get_bet_size()
+        bet_size = self.trader.get_bet_size()
         cost_with_fees = total + fees
         contracts = min(bet_size // cost_with_fees, qty) if cost_with_fees > 0 and qty > 0 else 0
         expected = contracts * net
@@ -230,7 +236,7 @@ class ArbBot:
         print(f"  Bought:   {pos['leg1_ticker']} {pos['leg1_side']}@{pos['leg1_price']}¢ + {pos['leg2_ticker']} {pos['leg2_side']}@{pos['leg2_price']}¢")
         print(f"  Sold:     @{pos.get('sell_leg1_price', '?')}¢ + @{pos.get('sell_leg2_price', '?')}¢")
         print(f"  Profit:   +{pos.get('exit_profit', 0)}¢ ({pos['contracts']} contracts)")
-        print(f"  Balance:  {self.paper_trader.balance}¢")
+        print(f"  Balance:  {self.trader.balance}¢")
         print("*" * 70 + "\n")
 
 
@@ -293,7 +299,7 @@ async def run_ws_scanner(bot: ArbBot, duration_sec: int = 0):
         )
         bot.total_signals += 1
         bot.print_signal(sig)
-        bot.paper_trader.execute_paper_trade(sig)
+        bot.trader.execute_paper_trade(sig)
 
     def _check_pair(arb_type: str, event_ticker: str,
                     t1: str, t2: str, label1: str, label2: str,
@@ -372,7 +378,7 @@ async def run_ws_scanner(bot: ArbBot, duration_sec: int = 0):
             if yb and yb > 0:
                 bid_data[t] = {"bid": yb}
         if bid_data:
-            exit_result = bot.paper_trader.check_exit_ws(ticker, bid_data)
+            exit_result = bot.trader.check_exit_ws(ticker, bid_data)
             if exit_result:
                 bot.print_exit(exit_result)
 
@@ -405,12 +411,18 @@ async def main():
         except ValueError:
             pass
 
-    paper = PaperTrader(initial_balance=BANKROLL_CENTS)
+    if LIVE_MODE:
+        client = KalshiClient()
+        trader = LiveTrader(client=client)
+        mode_label = "LIVE TRADING (REAL MONEY)"
+    else:
+        trader = PaperTrader(initial_balance=BANKROLL_CENTS)
+        mode_label = "PAPER TRADING (no real money)"
 
     logger.info("=" * 60)
-    logger.info("KALSHI ARBITRAGE BOT — PAPER TRADING")
+    logger.info("KALSHI ARBITRAGE BOT — %s", "LIVE" if LIVE_MODE else "PAPER")
     logger.info("=" * 60)
-    logger.info("Mode: PAPER TRADING (no real money)")
+    logger.info("Mode: %s", mode_label)
     logger.info("Min net arb: %.1f%% (after fees)", MIN_ARB_PERCENT)
     logger.info("Bankroll: %d¢ ($%.2f)", BANKROLL_CENTS, BANKROLL_CENTS / 100)
     logger.info("Bet size: %d%% = %d¢", BET_PERCENT, BANKROLL_CENTS * BET_PERCENT // 100)
@@ -420,7 +432,7 @@ async def main():
         logger.info("Duration: %d seconds", duration)
     logger.info("=" * 60)
 
-    bot = ArbBot(paper_trader=paper)
+    bot = ArbBot(trader=trader)
 
     try:
         balance_data = bot.client.get_balance()
@@ -437,7 +449,7 @@ async def main():
     except KeyboardInterrupt:
         pass
     finally:
-        paper.print_summary()
+        trader.print_summary()
 
 
 if __name__ == "__main__":

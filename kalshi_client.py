@@ -1,3 +1,5 @@
+import json
+import uuid
 import requests
 from typing import Optional
 from kalshi_auth import load_private_key_from_file, load_private_key_from_string, get_auth_headers
@@ -31,6 +33,26 @@ class KalshiClient:
                 url = f"{url}?{query}"
         headers = self._headers("GET", full_path)
         resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post(self, path: str, data: dict) -> dict:
+        full_path = f"{API_PATH_PREFIX}{path}"
+        url = f"{self.base_url}{full_path}"
+        headers = self._headers("POST", full_path)
+        resp = requests.post(url, headers=headers, json=data, timeout=15)
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code}: {resp.text}",
+                response=resp,
+            )
+        return resp.json()
+
+    def _delete(self, path: str) -> dict:
+        full_path = f"{API_PATH_PREFIX}{path}"
+        url = f"{self.base_url}{full_path}"
+        headers = self._headers("DELETE", full_path)
+        resp = requests.delete(url, headers=headers, timeout=10)
         resp.raise_for_status()
         return resp.json()
 
@@ -104,6 +126,45 @@ class KalshiClient:
             if not cursor:
                 break
         return all_events
+
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price: int,
+        client_order_id: Optional[str] = None,
+        time_in_force: str = "fill_or_kill",
+    ) -> dict:
+        if client_order_id is None:
+            client_order_id = str(uuid.uuid4())
+        body: dict = {
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "count": count,
+            "type": "limit",
+            "client_order_id": client_order_id,
+            "time_in_force": time_in_force,
+        }
+        if side == "yes":
+            body["yes_price"] = price
+        else:
+            body["no_price"] = price
+        return self._post("/portfolio/orders", body)
+
+    def cancel_order(self, order_id: str) -> dict:
+        return self._delete(f"/portfolio/orders/{order_id}")
+
+    def get_order(self, order_id: str) -> dict:
+        return self._get(f"/portfolio/orders/{order_id}")
+
+    def get_positions(self, cursor: Optional[str] = None, limit: int = 200) -> dict:
+        params = {"limit": str(limit)}
+        if cursor:
+            params["cursor"] = cursor
+        return self._get("/portfolio/positions", params)
 
     def get_all_markets_for_event(self, event_ticker: str) -> list:
         all_markets = []
